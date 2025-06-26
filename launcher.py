@@ -11,6 +11,7 @@ class TorchTune:
     def __init__(
         self,
         use_multi_node_config: bool = False,
+        config_overrides: Optional[Dict] = None,
     ):
         """
         Initialize the Tune launcher.
@@ -35,6 +36,8 @@ class TorchTune:
                     "num_processes": current.torch.torchrun_args["nproc_per_node"]
                     * current.torch.torchrun_args["nnodes"],
                 }
+                if config_overrides:
+                    self.multi_node_config.update(config_overrides)
                 print(f'[Metaflow Tune] Discovered multi-node config for torchrun: {self.multi_node_config}')
             else:
                 print(

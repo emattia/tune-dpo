@@ -23,6 +23,10 @@ model:
   # _component_: torchtune.models.llama3_2.llama3_2_3b
   _component_: torchtune.models.llama3_3.llama3_3_70b
 
+tensor_parallel_dim: 4
+tensor_parallel_plan:
+  _component_: torchtune.models.llama3.base_llama_tp_plan
+
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
   path: ${base_dir}/original/tokenizer.model
@@ -60,7 +64,7 @@ dataset:
   split: "train[:100000]"
 seed: null
 shuffle: True
-batch_size: 1
+batch_size: 16
 
 huggingface:
   repo_id: meta-llama/${base_model_name}
@@ -72,9 +76,9 @@ huggingface:
 # Optimizer and Scheduler
 optimizer:
   _component_: torch.optim.AdamW
-  fused: True
+  fused: False # Tensor parallel requires device mesh, which is not supported by Fused AdamW.
   weight_decay: 0.05
-  lr: 2e-5
+  lr: 1e-5
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
@@ -86,7 +90,7 @@ loss:
 
 # Training
 epochs: 1
-max_steps_per_epoch: 10
+max_steps_per_epoch: 50
 gradient_accumulation_steps: 1  # Use to increase effective batch size
 compile: False  # torch.compile the model + loss, True increases speed + decreases memory
 # custom_sharded_layers: ['attention', 'mlp', 'norm', 'rope']

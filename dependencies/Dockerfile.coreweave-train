@@ -1,0 +1,56 @@
+### BUILD STAGE - Same as your existing ###
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 AS builder
+
+ARG PYTHON_VERSION=3.12
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    wget \
+    curl \
+    bzip2
+
+RUN curl -sL https://micro.mamba.pm/api/micromamba/linux-64/1.1.0 \
+    | tar -xvj -C /usr/local bin/micromamba
+
+ENV MAMBA_EXE=/usr/local/bin/micromamba \
+    MAMBA_ROOT_PREFIX=/opt/micromamba \
+    CONDA_PREFIX=/opt/micromamba \
+    PATH=/opt/micromamba/bin:$PATH
+
+RUN micromamba create -y -n base && \
+    micromamba shell init --shell=bash --prefix="$MAMBA_ROOT_PREFIX"
+    
+RUN micromamba install python=${PYTHON_VERSION} pip -c conda-forge -y && \
+    python -m pip install --upgrade pip
+
+COPY train_requirements.txt /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
+
+### RUNTIME STAGE - Use CoreWeave RDMA base instead ###
+# This base image has OFED drivers, NCCL, UCC/UCX pre-installed
+FROM ghcr.io/coreweave/nccl-tests:12.9.1-devel-ubuntu22.04-nccl2.27.5-1-0120901
+
+# Add your micromamba setup on top of CoreWeave's RDMA base
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    bzip2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sL https://micro.mamba.pm/api/micromamba/linux-64/1.1.0 \
+    | tar -xvj -C /usr/local bin/micromamba
+
+ENV MAMBA_EXE=/usr/local/bin/micromamba \
+    MAMBA_ROOT_PREFIX=/opt/micromamba \
+    CONDA_PREFIX=/opt/micromamba \
+    PATH=/opt/micromamba/bin:$PATH
+
+# Copy your built Python environment from builder stage
+COPY --from=builder /opt/micromamba /opt/micromamba
+
+# Preserve CoreWeave's CUDA setup + add your CUDA libs if needed
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+ENTRYPOINT ["/bin/bash", "-c", "eval \"$(/usr/local/bin/micromamba shell hook --shell=bash)\" && micromamba activate base && exec \"$@\"", "--"]
+CMD ["bash"] 

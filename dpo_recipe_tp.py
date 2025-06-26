@@ -9,7 +9,8 @@ from warnings import warn
 import torch
 from omegaconf import DictConfig, ListConfig
 from torch import nn
-from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed import destroy_process_group, init_process_group, init_device_mesh
+from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, DistributedSampler
 from torchtune import config, modules, rlhf, training, utils
@@ -184,6 +185,25 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
         self.global_step = 0
 
+        # TP config
+        self.tensor_parallel_plan = config.instantiate(
+            cfg.get("tensor_parallel_plan", None)
+        )
+        if 'tensor_parallel_dim' not in cfg:
+            raise ValueError('No TP defined.')
+        self.tensor_parallel_dim = cfg.get("tensor_parallel_dim", 1)
+        
+        # Validation for tensor parallel configuration
+        if self.tensor_parallel_dim > 1 and self.tensor_parallel_plan is None:
+            raise ValueError(
+                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
+            )
+        if self.world_size % self.tensor_parallel_dim != 0:
+            raise ValueError(
+                f"world_size {self.world_size} must be divisible by tensor_parallel_dim {self.tensor_parallel_dim}"
+            )
+        self.data_parallel_dim = self.world_size // self.tensor_parallel_dim
+
     def _load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
         Extract the checkpoint state from file and validate. If resume_from_checkpoint
@@ -265,6 +285,7 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         ref_checkpoint_dict = self._load_ref_checkpoint(cfg.ref_checkpointer)
 
         self._compile = cfg.get("compile", False)
+        self._setup_device_mesh()
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
@@ -406,6 +427,15 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                 self.profiler_active_steps = profiler_cfg["active_steps"]
 
         return profiler
+    
+    def _setup_device_mesh(self):
+        self.device_mesh = init_device_mesh(
+            self._device.type,
+            mesh_shape=(self.data_parallel_dim, self.tensor_parallel_dim),
+            mesh_dim_names=("dp", "tp")
+        )
+        self.dp_size = self.device_mesh["dp"].size()
+        self.dp_rank = self.device_mesh["dp"].get_local_rank()
 
     def _setup_model(
         self,
@@ -437,6 +467,13 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         if self._compile:
             training.compile_model(model, verbose=self._is_rank_zero)
 
+        model = training.prepare_mha_for_tp(model, self.device_mesh["tp"])
+        parallelize_module(
+            model, 
+            self.device_mesh["tp"],
+            parallelize_plan=self.tensor_parallel_plan
+        )
+
         # original activation checkpointing (full) - flip the condition above
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
@@ -453,8 +490,9 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         training.shard_model(
             model=model,
             shard_conditions=fsdp_shard_conditions,
-            cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
+            cpu_offload=fsdp_cpu_offload,
+            dp_mesh=self.device_mesh['dp'] if self.data_parallel_dim > 1 else None,
         )
 
         with training.set_default_dtype(self._dtype), self._device:
@@ -530,6 +568,13 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         if self._compile:
             training.compile_model(model, verbose=self._is_rank_zero)
 
+        model = training.prepare_mha_for_tp(model, self.device_mesh["tp"])
+        parallelize_module(
+            model, 
+            self.device_mesh["tp"],
+            parallelize_plan=self.tensor_parallel_plan
+        )
+
         # For FSDP sharding
         fsdp_shard_conditions = [
             partial(
@@ -540,8 +585,9 @@ class FullDPORecipeDistributed(FTRecipeInterface):
         training.shard_model(
             model=model,
             shard_conditions=fsdp_shard_conditions,
-            cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
+            cpu_offload=fsdp_cpu_offload,
+            dp_mesh=self.device_mesh['dp'] if self.data_parallel_dim > 1 else None,
         )
 
         with training.set_default_dtype(self._dtype), self._device:
@@ -677,7 +723,11 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             ds = config.instantiate(cfg_dataset, tokenizer=self._tokenizer)
 
         sampler = DistributedSampler(
-            ds, num_replicas=self.world_size, rank=self.rank, shuffle=shuffle, seed=0
+            ds,
+            num_replicas=self.dp_size,
+            rank=self.dp_rank,
+            shuffle=shuffle, 
+            seed=0
         )
 
         dataloader = DataLoader(
@@ -892,13 +942,17 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                     break
 
                 # batch is input_ids, labels
-                num_tokens += torch.tensor(batch[0].numel())
+                # Only count tokens on TP rank 0 to avoid 4x inflation (TP workers process identical data)
+                if self.device_mesh["tp"].get_local_rank() == 0:
+                    num_tokens += torch.tensor(batch[0].numel())
                 
                 # Track scaling metrics
                 batch_size = batch[0].shape[0]
                 total_forward_passes += 2  # Policy model + Reference model forward passes
                 total_samples_processed += batch_size
-                total_tokens_processed += batch[0].numel()  # Accumulate tokens for epoch summary
+                # Only count tokens on TP rank 0 for epoch summary too
+                if self.device_mesh["tp"].get_local_rank() == 0:
+                    total_tokens_processed += batch[0].numel()  # Accumulate tokens for epoch summary
                 
                 (
                     policy_chosen_log_probs,
@@ -973,7 +1027,8 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                     torch.distributed.all_reduce(
                         running_loss, op=torch.distributed.ReduceOp.AVG
                     )
-                    torch.distributed.all_reduce(num_tokens)
+                    # Only reduce tokens across DP workers (TP workers would inflate count)
+                    torch.distributed.all_reduce(num_tokens, group=self.device_mesh["dp"].get_group())
 
                     for key in running_metrics:
                         torch.distributed.all_reduce(
@@ -1002,12 +1057,13 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                         # Calculate scaling metrics for unified display
                         tokens_per_sec_total = num_tokens / time_per_step
                         samples_per_sec_total = total_samples_processed / time_per_step
-                        effective_batch_size = batch_size * self.world_size
+                        # In TP: effective batch size scales with data parallel dimension only
+                        effective_batch_size = batch_size * self.data_parallel_dim
                         
-                        # Update progress bar with comprehensive info
+                        # Update progress bar with TP/DP info
                         pbar.set_description(
                             f"E{curr_epoch + 1}|S{self.global_step} ~ {tokens_per_sec_total:.0f} tok/s "
-                            f"~ {effective_batch_size} batch ~ Loss: {loss_to_log:.4f} ",
+                            f"~ DP{self.data_parallel_dim}xTP{self.tensor_parallel_dim} ~ {effective_batch_size} batch ~ Loss: {loss_to_log:.4f}",
                             refresh=False
                         )
                         pbar.update(1)
@@ -1033,8 +1089,10 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                                 "backward_passes_completed": total_backward_passes,
                                 "optimizer_steps_completed": total_optimizer_steps,
                                 "total_tokens_processed": total_tokens_processed,
-                                "world_size": self.world_size,  # == num_data_parallel_workers in this setup
-                                "num_data_parallel_workers": self.world_size,
+                                "world_size": self.world_size,  # Total workers (DP * TP)
+                                "data_parallel_dim": self.data_parallel_dim,
+                                "tensor_parallel_dim": self.tensor_parallel_dim,
+                                "num_data_parallel_workers": self.data_parallel_dim,
                                 "rewards/chosen": running_metrics["rewards/chosen"].cpu(),
                                 "rewards/rejected": running_metrics[
                                     "rewards/rejected"
@@ -1076,7 +1134,16 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                     # Note that this is called within gradient accumulation block, hence
                     # will include multiple forward / backward passes if gradient accumulation > 1
                     self._profiler.step()
-            
+
+                    # Add this in your training loop after batch processing
+                    if self._is_rank_zero and self.global_step % 10 == 0:
+                        seq_lens = [len(seq[seq != self._tokenizer.pad_id]) for seq in batch[0]]
+                        avg_len = sum(seq_lens) / len(seq_lens)
+                        utils.log_rank_zero(log, f"Step {self.global_step}: Avg sequence length: {avg_len:.0f} tokens")
+
+            # Synchronize all ranks before epoch summary
+            torch.distributed.barrier()
+
             self.epochs_run += 1
             
             # Print detailed epoch summary for scaling analysis
@@ -1084,7 +1151,9 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             # but only rank 0 will print the results
             
             # Calculate per-worker metrics (same for all ranks)
-            num_data_parallel_workers = self.world_size
+            # In TP: load balancing only matters across data parallel workers
+            # TP workers within same DP group process identical data
+            num_data_parallel_workers = self.data_parallel_dim
             forward_passes_per_worker = total_forward_passes
             backward_passes_per_worker = total_backward_passes
             optimizer_steps_per_worker = total_optimizer_steps
@@ -1096,10 +1165,11 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             global_optimizer_steps_tensor = torch.tensor(optimizer_steps_per_worker, device=self._device)
             global_tokens_processed_tensor = torch.tensor(tokens_processed_per_worker, device=self._device)
             
-            torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_tokens_processed_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
+            torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
+            torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
+            # Only reduce tokens across DP workers to avoid TP inflation
+            torch.distributed.all_reduce(global_tokens_processed_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
             
             global_forward_passes = global_forward_passes_tensor.item()
             global_backward_passes = global_backward_passes_tensor.item()
@@ -1110,8 +1180,9 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             min_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
             max_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
             
-            torch.distributed.all_reduce(min_tokens_per_worker, op=torch.distributed.ReduceOp.MIN)
-            torch.distributed.all_reduce(max_tokens_per_worker, op=torch.distributed.ReduceOp.MAX)
+            # Only compare load balancing across DP workers (TP workers process identical data)
+            torch.distributed.all_reduce(min_tokens_per_worker, op=torch.distributed.ReduceOp.MIN, group=self.device_mesh["dp"].get_group())
+            torch.distributed.all_reduce(max_tokens_per_worker, op=torch.distributed.ReduceOp.MAX, group=self.device_mesh["dp"].get_group())
             
             min_tokens = min_tokens_per_worker.item()
             max_tokens = max_tokens_per_worker.item()
@@ -1133,8 +1204,8 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                       f"{epoch_tokens_per_sec:,.0f} tok/s | "
                       f"{global_tokens_processed:,} total tokens | "
                       f"Load imbalance: {imbalance_str} | "
-                      f"Workers: {num_data_parallel_workers} | "
-                      f"Steps: {self.global_step}")
+                      f"DP Workers: {num_data_parallel_workers} | TP Dim: {self.tensor_parallel_dim} | "
+                      f"Total GPUs: {self.world_size} | Steps: {self.global_step}")
             
             self.save_checkpoint(epoch=curr_epoch)
 

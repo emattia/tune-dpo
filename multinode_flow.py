@@ -12,16 +12,18 @@ from metaflow import (
     huggingface_hub,
     checkpoint,
     kubernetes,
-    secrets
+    secrets,
+    torchrun
 )
 
 # NOTE: We will shortly release this as part of the default Outerbounds Metaflow distribution.
 from launcher import TorchTune
 
-N_GPU = 4
+N_GPU = 8
+N_NODES = 4
 
 if N_GPU==8: # tested on H100 80GB
-    coreweave_k8s_config = dict(
+    k8s_config = dict(
         compute_pool="cks-h100",
         cpu=100,
         memory=900 * 1000,
@@ -30,10 +32,13 @@ if N_GPU==8: # tested on H100 80GB
         # This thing needs a security context of `V1Container` with privilage=true to use Infiniband.
         disk=1000 * 1000,
         use_tmpfs=True,
+        security_context=dict(
+            privileged=True,
+        ),
     )
 
 elif N_GPU==4: # tested on a10g, AWS g5.12xlarge
-    coreweave_k8s_config = dict(
+    k8s_config = dict(
         compute_pool="a10g4x",
         cpu=42,
         memory=164 * 1000,
@@ -91,12 +96,25 @@ def training_environment(func):
             vars={
                 "WANDB_PROJECT": "dpo",
                 "WANDB_LOG_MODEL": "false",
+
+                "OMP_NUM_THREADS": "8",
+                "TORCH_DIST_INIT_BARRIER": "1",
+                # Multinode NCCL settings for Coreweave
+                # https://docs.coreweave.com/docs/products/networking/how-to/use-rdma#kubernetes-example
+                "NCCL_SOCKET_IFNAME": "eth0", # The network interface name to use for NCCL communication. 
+                                              # This should be set to the InfiniBand interface name.
+
+                # Coreweave InfiniBand settings
+                "NCCL_IB_HCA": "ibp",         # The InfiniBand host channel adapter (HCA) to use for NCCL communication.
+                "UCX_NET_DEVICES": "ibp0:1,ibp1:1,ibp2:1,ibp3:1,ibp4:1,ibp5:1,ibp6:1,ibp7:1",        
+                                              # The network devices to use for UCX communication. 
+                                              # This should be set to the InfiniBand interface name.
+
+                # Nebius InfiniBand settings
                 # "NCCL_IB_HCA": "mlx5",
                 # "UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
-                # "SHARP_COLL_ENABLE_PCI_RELAXED_ORDERING": "1",
-                # "NCCL_COLLNET_ENABLE": "0",
-                "OMP_NUM_THREADS": "8",
-                "TORCH_DIST_INIT_BARRIER": "1"
+
+                # "NCCL_DEBUG": "INFO",         # For debugging; remove in production
             }
         ),
     ]
@@ -140,7 +158,7 @@ def inference_environment(func):
     return func
 
 
-class DPOPostTrainDemo(FlowSpec):
+class DPOPostTrainMultinodeDemo(FlowSpec):
 
     training_config = IncludeFile(
         "config",
@@ -174,7 +192,7 @@ class DPOPostTrainDemo(FlowSpec):
         self.next(self.pull_model)
 
     @model_cache_environment
-    @kubernetes(**coreweave_k8s_config, image='docker.io/eddieob/hf-model-cache')
+    @kubernetes(**k8s_config, image='docker.io/eddieob/hf-model-cache')
     @step
     def pull_model(self):
         '''
@@ -198,7 +216,7 @@ class DPOPostTrainDemo(FlowSpec):
             )
         else: 
             self.base_model = self.prev_model_key
-        self.next(self.train)
+        self.next(self.train, num_parallel=N_NODES)
 
     # TODO: Read checkpointing docs at
     # https://docs.metaflow.org/scaling/checkpoint/checkpoint-ml-libraries#checkpointing-pytorch
@@ -212,7 +230,9 @@ class DPOPostTrainDemo(FlowSpec):
         temp_dir_root="metaflow-chkpt-train/loaded_models"
     )
     @training_environment
-    @kubernetes(**coreweave_k8s_config, image="docker.io/eddieob/torchtune-train")
+    # @kubernetes(**k8s_config, image="docker.io/eddieob/torchtune-train")
+    @kubernetes(**k8s_config, image="docker.io/eddieob/coreweave-torchtune-train:mine")
+    @torchrun
     @step
     def train(self):
         import yaml
@@ -235,51 +255,58 @@ class DPOPostTrainDemo(FlowSpec):
         config["output_dir"] = os.path.join(current.tempdir, "output")
         # config["dataset"]["split"] = self.train_split
 
-        tune = TorchTune(use_multi_node_config=False)
+        tune = TorchTune(
+            use_multi_node_config=True, 
+            config_overrides={"nproc_per_node": N_GPU}
+        )
         tune.run(
             self.recipe,
             config_dict=config,
-            additional_cli_options=[
-                "--nproc-per-node", 
-                str(N_GPU)
-            ],
+            # additional_cli_options removed since @torchrun handles this
         )
 
-        self.dpo_model_ref = current.model.save(
-            os.path.join(
-                config["output_dir"],
-                "epoch_" + str(config["epochs"] - 1),
-            ),
-            storage_format="files",
-        )
-        self.next(self.eval)
+        # if current.parallel.node_index == 0:
+        #     self.dpo_model_ref = current.model.save(
+        #         os.path.join(
+        #             config["output_dir"],
+        #             "epoch_" + str(config["epochs"] - 1),
+        #         ),
+        #         storage_format="files",
+        #     )
+        self.next(self.join)
 
-    @card
-    @model(
-        load=[("dpo_model_ref", "metaflow-chkpt-infer/dpo_model")], 
-        temp_dir_root="metaflow-chkpt-infer/loaded_models"
-    )
-    @inference_environment
-    @kubernetes(**coreweave_k8s_config, image="docker.io/eddieob/torchtune-vllm-inference")
     @step
-    def eval(self):
-        from dpo_eval import run_eval
+    def join(self, inputs):
+        # self.dpo_model_ref = inputs[0].dpo_model_ref
+    #     self.next(self.eval)
 
-        self.results = run_eval(
-            checkpoint_path=current.model.loaded["dpo_model_ref"],
-            # data_split=self.test_split,
-            output_dir="results",
-            max_batches=10,
-            world_size=N_GPU,
-            seed=42
-        )
+    # @card
+    # @model(
+    #     load=[("dpo_model_ref", "metaflow-chkpt-infer/dpo_model")], 
+    #     temp_dir_root="metaflow-chkpt-infer/loaded_models"
+    # )
+    # @inference_environment
+    # @kubernetes(**k8s_config, image="docker.io/eddieob/torchtune-vllm-inference")
+    # @step
+    # def eval(self):
+    #     from dpo_eval import run_eval
+
+    #     self.results = run_eval(
+    #         checkpoint_path=current.model.loaded["dpo_model_ref"],
+    #         # data_split=self.test_split,
+    #         output_dir="results",
+    #         max_batches=10,
+    #         world_size=N_GPU,
+    #         seed=42
+    #     )
         self.next(self.end)
 
     @step
     def end(self):
         """End of flow"""
-        print("Final Model Key:", self.dpo_model_ref)
+        # print("Final Model Key:", self.dpo_model_ref)
+        pass
 
 
 if __name__ == "__main__":
-    DPOPostTrainDemo()
+    DPOPostTrainMultinodeDemo()
