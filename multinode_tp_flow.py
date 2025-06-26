@@ -16,8 +16,8 @@ from metaflow import (
     torchrun
 )
 
-# NOTE: We will shortly release this as part of the default Outerbounds Metaflow distribution.
-from launcher import TorchTune
+# from launcher import TorchTune
+from metaflow.plugins.torchtune import TorchTune
 
 N_GPU = 8
 N_NODES = 4

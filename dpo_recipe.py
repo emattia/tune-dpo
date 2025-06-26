@@ -1083,59 +1083,61 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             # ALL ranks must participate in collective operations (all_reduce)
             # but only rank 0 will print the results
             
-            # Calculate per-worker metrics (same for all ranks)
-            num_data_parallel_workers = self.world_size
-            forward_passes_per_worker = total_forward_passes
-            backward_passes_per_worker = total_backward_passes
-            optimizer_steps_per_worker = total_optimizer_steps
-            tokens_processed_per_worker = total_tokens_processed
+            # # Calculate per-worker metrics (same for all ranks)
+            # num_data_parallel_workers = self.world_size
+            # forward_passes_per_worker = total_forward_passes
+            # backward_passes_per_worker = total_backward_passes
+            # optimizer_steps_per_worker = total_optimizer_steps
+            # tokens_processed_per_worker = total_tokens_processed
             
-            # Sum counts from all workers - ALL ranks participate
-            global_forward_passes_tensor = torch.tensor(forward_passes_per_worker, device=self._device)
-            global_backward_passes_tensor = torch.tensor(backward_passes_per_worker, device=self._device)
-            global_optimizer_steps_tensor = torch.tensor(optimizer_steps_per_worker, device=self._device)
-            global_tokens_processed_tensor = torch.tensor(tokens_processed_per_worker, device=self._device)
+            # # Sum counts from all workers - ALL ranks participate
+            # global_forward_passes_tensor = torch.tensor(forward_passes_per_worker, device=self._device)
+            # global_backward_passes_tensor = torch.tensor(backward_passes_per_worker, device=self._device)
+            # global_optimizer_steps_tensor = torch.tensor(optimizer_steps_per_worker, device=self._device)
+            # global_tokens_processed_tensor = torch.tensor(tokens_processed_per_worker, device=self._device)
             
-            torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_tokens_processed_tensor, op=torch.distributed.ReduceOp.SUM)
+            # torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
+            # torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
+            # torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM)
+            # torch.distributed.all_reduce(global_tokens_processed_tensor, op=torch.distributed.ReduceOp.SUM)
             
-            global_forward_passes = global_forward_passes_tensor.item()
-            global_backward_passes = global_backward_passes_tensor.item()
-            global_optimizer_steps = global_optimizer_steps_tensor.item()
-            global_tokens_processed = global_tokens_processed_tensor.item()
+            # global_forward_passes = global_forward_passes_tensor.item()
+            # global_backward_passes = global_backward_passes_tensor.item()
+            # global_optimizer_steps = global_optimizer_steps_tensor.item()
+            # global_tokens_processed = global_tokens_processed_tensor.item()
             
-            # Analyze load balancing across workers - ALL ranks participate
-            min_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
-            max_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
+            # # Analyze load balancing across workers - ALL ranks participate
+            # min_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
+            # max_tokens_per_worker = torch.tensor(tokens_processed_per_worker, device=self._device)
             
-            torch.distributed.all_reduce(min_tokens_per_worker, op=torch.distributed.ReduceOp.MIN)
-            torch.distributed.all_reduce(max_tokens_per_worker, op=torch.distributed.ReduceOp.MAX)
+            # torch.distributed.all_reduce(min_tokens_per_worker, op=torch.distributed.ReduceOp.MIN)
+            # torch.distributed.all_reduce(max_tokens_per_worker, op=torch.distributed.ReduceOp.MAX)
             
-            min_tokens = min_tokens_per_worker.item()
-            max_tokens = max_tokens_per_worker.item()
-            avg_tokens_per_worker = global_tokens_processed / num_data_parallel_workers
+            # min_tokens = min_tokens_per_worker.item()
+            # max_tokens = max_tokens_per_worker.item()
+            # avg_tokens_per_worker = global_tokens_processed / num_data_parallel_workers
             
             # Only rank 0 prints the summary
-            if self._is_rank_zero:
-                # Calculate epoch timing and load imbalance
-                epoch_duration = time.perf_counter() - epoch_start_time
-                epoch_tokens_per_sec = global_tokens_processed / epoch_duration
+            # if self._is_rank_zero:
+            #     # Calculate epoch timing and load imbalance
+            #     epoch_duration = time.perf_counter() - epoch_start_time
+            #     epoch_tokens_per_sec = global_tokens_processed / epoch_duration
                 
-                if max_tokens > min_tokens:
-                    imbalance_pct = ((max_tokens - min_tokens) / avg_tokens_per_worker) * 100
-                    imbalance_str = f"{imbalance_pct:.1f}%"
-                else:
-                    imbalance_str = "0% (perfect)"
+            #     if max_tokens > min_tokens:
+            #         imbalance_pct = ((max_tokens - min_tokens) / avg_tokens_per_worker) * 100
+            #         imbalance_str = f"{imbalance_pct:.1f}%"
+            #     else:
+            #         imbalance_str = "0% (perfect)"
                 
-                print(f"\n[EPOCH {curr_epoch + 1}] {epoch_duration:.1f}s | "
-                      f"{epoch_tokens_per_sec:,.0f} tok/s | "
-                      f"{global_tokens_processed:,} total tokens | "
-                      f"Load imbalance: {imbalance_str} | "
-                      f"Workers: {num_data_parallel_workers} | "
-                      f"Steps: {self.global_step}")
+            #     print(f"\n[EPOCH {curr_epoch + 1}] {epoch_duration:.1f}s | "
+            #           f"{epoch_tokens_per_sec:,.0f} tok/s | "
+            #           f"{global_tokens_processed:,} total tokens | "
+            #           f"Load imbalance: {imbalance_str} | "
+            #           f"Workers: {num_data_parallel_workers} | "
+            #           f"Steps: {self.global_step}")
             
+            if self._is_rank_zero and pbar is not None:
+                pbar.close()
             self.save_checkpoint(epoch=curr_epoch)
 
         self._profiler.stop()

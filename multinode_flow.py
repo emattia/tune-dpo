@@ -16,8 +16,8 @@ from metaflow import (
     torchrun
 )
 
-# NOTE: We will shortly release this as part of the default Outerbounds Metaflow distribution.
-from launcher import TorchTune
+# from launcher import TorchTune
+from metaflow.plugins.torchtune import TorchTune
 
 N_GPU = 8
 N_NODES = 4
@@ -99,18 +99,19 @@ def training_environment(func):
 
                 "OMP_NUM_THREADS": "8",
                 "TORCH_DIST_INIT_BARRIER": "1",
-                # Multinode NCCL settings for Coreweave
-                # https://docs.coreweave.com/docs/products/networking/how-to/use-rdma#kubernetes-example
+
+                ### Multinode NCCL settings ###
                 "NCCL_SOCKET_IFNAME": "eth0", # The network interface name to use for NCCL communication. 
                                               # This should be set to the InfiniBand interface name.
 
-                # Coreweave InfiniBand settings
+                ### Coreweave InfiniBand settings ###
+                # https://docs.coreweave.com/docs/products/networking/how-to/use-rdma#kubernetes-example
                 "NCCL_IB_HCA": "ibp",         # The InfiniBand host channel adapter (HCA) to use for NCCL communication.
                 "UCX_NET_DEVICES": "ibp0:1,ibp1:1,ibp2:1,ibp3:1,ibp4:1,ibp5:1,ibp6:1,ibp7:1",        
                                               # The network devices to use for UCX communication. 
                                               # This should be set to the InfiniBand interface name.
 
-                # Nebius InfiniBand settings
+                ### Nebius InfiniBand settings ###
                 # "NCCL_IB_HCA": "mlx5",
                 # "UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
 

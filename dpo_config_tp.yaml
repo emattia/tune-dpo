@@ -23,7 +23,7 @@ model:
   # _component_: torchtune.models.llama3_2.llama3_2_3b
   _component_: torchtune.models.llama3_3.llama3_3_70b
 
-tensor_parallel_dim: 4
+tensor_parallel_dim: 2
 tensor_parallel_plan:
   _component_: torchtune.models.llama3.base_llama_tp_plan
 
@@ -64,7 +64,7 @@ dataset:
   split: "train[:100000]"
 seed: null
 shuffle: True
-batch_size: 8
+batch_size: 4
 
 huggingface:
   repo_id: meta-llama/${base_model_name}
