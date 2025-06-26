@@ -909,7 +909,7 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             "logits/chosen": 0,
             "logits/rejected": 0,
         }
-        num_tokens = 0
+        num_tokens = torch.tensor(0, device=self._device)
 
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -1125,7 +1125,7 @@ class FullDPORecipeDistributed(FTRecipeInterface):
                     # Reset running stats for the next step
                     running_loss = 0
                     running_metrics = {key: 0 for key in running_metrics}
-                    num_tokens = 0
+                    num_tokens = torch.tensor(0, device=self._device)
                     total_samples_processed = 0  # Reset per-step counter
 
                     t0 = time.perf_counter()
@@ -1165,9 +1165,9 @@ class FullDPORecipeDistributed(FTRecipeInterface):
             global_optimizer_steps_tensor = torch.tensor(optimizer_steps_per_worker, device=self._device)
             global_tokens_processed_tensor = torch.tensor(tokens_processed_per_worker, device=self._device)
             
-            torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
-            torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
-            torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
+            torch.distributed.all_reduce(global_forward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(global_backward_passes_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(global_optimizer_steps_tensor, op=torch.distributed.ReduceOp.SUM)
             # Only reduce tokens across DP workers to avoid TP inflation
             torch.distributed.all_reduce(global_tokens_processed_tensor, op=torch.distributed.ReduceOp.SUM, group=self.device_mesh["dp"].get_group())
             

@@ -64,7 +64,7 @@ dataset:
   split: "train[:100000]"
 seed: null
 shuffle: True
-batch_size: 16
+batch_size: 8
 
 huggingface:
   repo_id: meta-llama/${base_model_name}
