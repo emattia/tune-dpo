@@ -1,4 +1,4 @@
-### BUILD STAGE - Same as your existing ###
+### BUILD STAGE ###
 FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 AS builder
 
 ARG PYTHON_VERSION=3.12
