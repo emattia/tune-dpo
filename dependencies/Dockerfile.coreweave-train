@@ -27,7 +27,7 @@ RUN micromamba install python=${PYTHON_VERSION} pip -c conda-forge -y && \
 COPY train_requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
-### RUNTIME STAGE - Use CoreWeave RDMA base instead ###
+### RUNTIME STAGE - Use CoreWeave RDMA base ###
 # This base image has OFED drivers, NCCL, UCC/UCX pre-installed
 FROM ghcr.io/coreweave/nccl-tests:12.9.1-devel-ubuntu22.04-nccl2.27.5-1-0120901
 
